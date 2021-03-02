@@ -42,6 +42,13 @@ var defaultContextTimeout = 30 * time.Second
 func etcdKvsToSet(prefix string, kvs []*mvccpb.KeyValue) set.StringSet {
 	users := set.NewStringSet()
 	for _, kv := range kvs {
+		user := extractPrefixAndBase(string(kv.Key), prefix) 
+		users.Add(user)
+	}
+	return users
+}
+
+func extractPrefixAndBase(s string, prefix string ) string {
 		// Extract user by stripping off the `prefix` value as suffix,
 		// then strip off the remaining basename to obtain the prefix
 		// value, usually in the following form.
@@ -50,10 +57,7 @@ func etcdKvsToSet(prefix string, kvs []*mvccpb.KeyValue) set.StringSet {
 		//  prefix := "config/iam/users/"
 		//  v := trim(trim(key, prefix), base(key)) == "newuser"
 		//
-		user := path.Clean(strings.TrimSuffix(strings.TrimPrefix(string(kv.Key), prefix), path.Base(string(kv.Key))))
-		users.Add(user)
-	}
-	return users
+		return path.Clean(strings.TrimSuffix(strings.TrimPrefix(string(s), prefix), path.Base(string(s))))
 }
 
 func etcdKvsToSetPolicyDB(prefix string, kvs []*mvccpb.KeyValue) set.StringSet {
@@ -112,6 +116,20 @@ func (ies *IAMEtcdStore) saveIAMConfig(ctx context.Context, item interface{}, pa
 	}
 	return saveKeyEtcd(ctx, ies.client, path, data, opts...)
 }
+
+
+func (ies *IAMEtcdStore) getIAMConfig(item interface{}, value []byte) error {
+	conf := value
+	var err error
+	if globalConfigEncrypted && !utf8.Valid(value) {
+		conf, err = madmin.DecryptData(globalActiveCred.String(), bytes.NewReader(conf))
+		if err != nil {
+			return err
+		}
+	}
+	return json.Unmarshal(conf, item)
+}
+
 
 func (ies *IAMEtcdStore) loadIAMConfig(ctx context.Context, item interface{}, path string) error {
 	pdata, err := readKeyEtcd(ctx, ies.client, path)
@@ -217,6 +235,8 @@ func (ies *IAMEtcdStore) migrateUsersConfigToV1(ctx context.Context, isSTS bool)
 }
 
 func (ies *IAMEtcdStore) migrateToV1(ctx context.Context) error {
+	logTime("Performing Migration...")
+	defer logTime("Migration done")
 	var iamFmt iamFormat
 	path := getIAMFormatFilePath()
 	if err := ies.loadIAMConfig(ctx, &iamFmt, path); err != nil {
@@ -260,6 +280,7 @@ func (ies *IAMEtcdStore) migrateBackendFormat(ctx context.Context) error {
 	return ies.migrateToV1(ctx)
 }
 
+//deprecated
 func (ies *IAMEtcdStore) loadPolicyDoc(ctx context.Context, policy string, m map[string]iampolicy.Policy) error {
 	var p iampolicy.Policy
 	err := ies.loadIAMConfig(ctx, &p, getPolicyDocPath(policy))
@@ -273,19 +294,35 @@ func (ies *IAMEtcdStore) loadPolicyDoc(ctx context.Context, policy string, m map
 	return nil
 }
 
+func (ies *IAMEtcdStore) getPolicyDoc(ctx context.Context, kvs *mvccpb.KeyValue, m map[string]iampolicy.Policy) error {
+	var p iampolicy.Policy
+	err := ies.getIAMConfig(&p, kvs.Value)
+	if err != nil {
+		if err == errConfigNotFound {
+			return errNoSuchPolicy
+		}
+		return err
+	}
+	policy := extractPrefixAndBase(string(kvs.Key), iamConfigPoliciesPrefix)
+	m[policy] = p
+	return nil
+}
+
+
 func (ies *IAMEtcdStore) loadPolicyDocs(ctx context.Context, m map[string]iampolicy.Policy) error {
+
 	ctx, cancel := context.WithTimeout(ctx, defaultContextTimeout)
 	defer cancel()
-	r, err := ies.client.Get(ctx, iamConfigPoliciesPrefix, etcd.WithPrefix(), etcd.WithKeysOnly())
+	logTime("   Getting Policies from Etcd")
+	r, err := ies.client.Get(ctx, iamConfigPoliciesPrefix, etcd.WithPrefix())
 	if err != nil {
 		return err
 	}
 
-	policies := etcdKvsToSet(iamConfigPoliciesPrefix, r.Kvs)
-
-	// Reload config and policies for all policys.
-	for _, policyName := range policies.ToSlice() {
-		if err = ies.loadPolicyDoc(ctx, policyName, m); err != nil && err != errNoSuchPolicy {
+	logTime("   extracting policies")
+	// extract each policy.
+	for _, kvs := range r.Kvs {
+		if err = ies.getPolicyDoc(ctx, kvs, m); err != nil && err != errNoSuchPolicy {
 			return err
 		}
 	}
@@ -337,7 +374,58 @@ func (ies *IAMEtcdStore) loadUser(ctx context.Context, user string, userType IAM
 
 }
 
+
+func (ies *IAMEtcdStore) getUser(ctx context.Context, userkv *mvccpb.KeyValue, userType IAMUserType, m map[string]auth.Credentials, basePrefix string) error {
+	var u UserIdentity
+	user := extractPrefixAndBase(string(userkv.Key), basePrefix)
+	err := ies.getIAMConfig(&u, userkv.Value)
+	if err != nil {
+		if err == errConfigNotFound {
+			return errNoSuchUser
+		}
+		return err
+	}
+	return ies.setupUser(ctx , user, userType, u, m)
+}
+
+func (ies *IAMEtcdStore) setupUser(ctx context.Context, userName string, userType IAMUserType, u UserIdentity , m map[string]auth.Credentials) error {
+	if u.Credentials.IsExpired() {
+		// Delete expired identity.
+		deleteKeyEtcd(ctx, ies.client, getUserIdentityPath(userName, userType))
+		deleteKeyEtcd(ctx, ies.client, getMappedPolicyPath(userName, userType, false))
+		return nil
+	}
+
+	// If this is a service account, rotate the session key if we are changing the server creds
+	if globalOldCred.IsValid() && u.Credentials.IsServiceAccount() {
+		if !globalOldCred.Equal(globalActiveCred) {
+			m := jwtgo.MapClaims{}
+			stsTokenCallback := func(t *jwtgo.Token) (interface{}, error) {
+				return []byte(globalOldCred.SecretKey), nil
+			}
+			if _, err := jwtgo.ParseWithClaims(u.Credentials.SessionToken, m, stsTokenCallback); err == nil {
+				jwt := jwtgo.NewWithClaims(jwtgo.SigningMethodHS512, jwtgo.MapClaims(m))
+				if token, err := jwt.SignedString([]byte(globalActiveCred.SecretKey)); err == nil {
+					u.Credentials.SessionToken = token
+					err := ies.saveIAMConfig(ctx, &u, getUserIdentityPath(userName, userType))
+					if err != nil {
+						return err
+					}
+				}
+			}
+		}
+	}
+
+	if u.Credentials.AccessKey == "" {
+		u.Credentials.AccessKey = userName
+	}
+	m[userName] = u.Credentials
+	return nil
+}
+
+
 func (ies *IAMEtcdStore) loadUsers(ctx context.Context, userType IAMUserType, m map[string]auth.Credentials) error {
+
 	var basePrefix string
 	switch userType {
 	case srvAccUser:
@@ -346,21 +434,25 @@ func (ies *IAMEtcdStore) loadUsers(ctx context.Context, userType IAMUserType, m 
 		basePrefix = iamConfigSTSPrefix
 	default:
 		basePrefix = iamConfigUsersPrefix
+		//start profiling when this method is called until the end
+		// if _, err := os.Stat("cpuprofile-users.prof"); os.IsNotExist(err){
+		// 	f, _ := os.Create("cpuprofile-users.prof")
+		// 	pprof.StartCPUProfile(f)
+		// 	defer pprof.StopCPUProfile()
+		// }
 	}
 
 	cctx, cancel := context.WithTimeout(ctx, defaultContextTimeout)
 	defer cancel()
 
-	r, err := ies.client.Get(cctx, basePrefix, etcd.WithPrefix(), etcd.WithKeysOnly())
+	r, err := ies.client.Get(cctx, basePrefix, etcd.WithPrefix())
 	if err != nil {
 		return err
 	}
 
-	users := etcdKvsToSet(basePrefix, r.Kvs)
-
-	// Reload config for all users.
-	for _, user := range users.ToSlice() {
-		if err = ies.loadUser(ctx, user, userType, m); err != nil && err != errNoSuchUser {
+	//extract user from resulting etcd query
+	for _, userKv := range r.Kvs {
+		if err = ies.getUser(ctx, userKv, userType, m ,basePrefix); err != nil && err != errNoSuchUser {
 			return err
 		}
 	}

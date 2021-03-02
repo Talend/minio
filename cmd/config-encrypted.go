@@ -145,6 +145,8 @@ func migrateIAMConfigsEtcdToEncrypted(ctx context.Context, client *etcd.Client) 
 	} else {
 		logger.Info("Attempting encryption of all IAM users and policies on etcd")
 	}
+	logTime("start encrypting IAM data")
+	defer logTime("encrypting IAM data finished")
 
 	listCtx, cancel := context.WithTimeout(ctx, 1*time.Minute)
 	defer cancel()

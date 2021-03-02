@@ -101,6 +101,11 @@ type iamFormat struct {
 	Version int `json:"version"`
 }
 
+func logTime(message string){
+	t := time.Now()
+	logger.Info("[%s] %s", t.Format("2006-01-02 15:04:05"), message)
+}
+
 func newIAMFormatVersion1() iamFormat {
 	return iamFormat{Version: iamFormatVersion1}
 }
@@ -444,6 +449,9 @@ func (sys *IAMSys) Initialized() bool {
 
 // Load - loads all credentials
 func (sys *IAMSys) Load(ctx context.Context, store IAMStorageAPI) error {
+	logTime("Loading all credentials")
+	defer logTime("Loading all credentials finished")
+
 	iamUsersMap := make(map[string]auth.Credentials)
 	iamGroupsMap := make(map[string]GroupInfo)
 	iamUserPolicyMap := make(map[string]MappedPolicy)
@@ -454,14 +462,17 @@ func (sys *IAMSys) Load(ctx context.Context, store IAMStorageAPI) error {
 	isMinIOUsersSys := sys.usersSysType == MinIOUsersSysType
 	store.runlock()
 
+	logTime("Loading all policies")
 	if err := store.loadPolicyDocs(ctx, iamPolicyDocsMap); err != nil {
 		return err
 	}
 
+	logTime("Setting default canned policies")
 	// Sets default canned policies, if none are set.
 	setDefaultCannedPolicies(iamPolicyDocsMap)
 
 	if isMinIOUsersSys {
+		logTime("Loading all MinIOUsersSys  users")
 		if err := store.loadUsers(ctx, regularUser, iamUsersMap); err != nil {
 			return err
 		}
@@ -470,6 +481,7 @@ func (sys *IAMSys) Load(ctx context.Context, store IAMStorageAPI) error {
 		}
 	}
 
+	logTime("Loading mapped policies")
 	// load polices mapped to users
 	if err := store.loadMappedPolicies(ctx, regularUser, false, iamUserPolicyMap); err != nil {
 		return err
@@ -480,15 +492,18 @@ func (sys *IAMSys) Load(ctx context.Context, store IAMStorageAPI) error {
 		return err
 	}
 
+	logTime("Loading all users")
 	if err := store.loadUsers(ctx, srvAccUser, iamUsersMap); err != nil {
 		return err
 	}
 
+	logTime("Loading STS temp users")
 	// load STS temp users
 	if err := store.loadUsers(ctx, stsUser, iamUsersMap); err != nil {
 		return err
 	}
 
+	logTime("Loading STS policy mappings")
 	// load STS policy mappings
 	if err := store.loadMappedPolicies(ctx, stsUser, false, iamUserPolicyMap); err != nil {
 		return err
@@ -560,6 +575,8 @@ func (sys *IAMSys) Load(ctx context.Context, store IAMStorageAPI) error {
 
 // Init - initializes config system by reading entries from config/iam
 func (sys *IAMSys) Init(ctx context.Context, objAPI ObjectLayer) {
+	logTime("Initializing IAM config")
+
 	// Initialize IAM store
 	sys.InitStore(objAPI)
 
@@ -728,6 +745,7 @@ func (sys *IAMSys) InfoPolicy(policyName string) (iampolicy.Policy, error) {
 
 // ListPolicies - lists all canned policies.
 func (sys *IAMSys) ListPolicies() (map[string]iampolicy.Policy, error) {
+	logger.Info("listing all policies")
 	if !sys.Initialized() {
 		return nil, errServerNotInitialized
 	}
@@ -907,6 +925,7 @@ func (sys *IAMSys) SetTempUser(accessKey string, cred auth.Credentials, policyNa
 
 // ListUsers - list all users.
 func (sys *IAMSys) ListUsers() (map[string]madmin.UserInfo, error) {
+	logger.Info("listing all users")
 	if !sys.Initialized() {
 		return nil, errServerNotInitialized
 	}

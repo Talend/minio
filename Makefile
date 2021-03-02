@@ -24,7 +24,8 @@ getdeps:
 crosscompile:
 	@(env bash $(PWD)/buildscripts/cross-compile.sh)
 
-verifiers: getdeps fmt lint ruleguard check-gen
+#verifiers: getdeps fmt lint ruleguard check-gen
+verifiers: getdeps fmt lint check-gen
 
 check-gen:
 	@go generate ./... >/dev/null
