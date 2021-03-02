@@ -22,6 +22,7 @@ import (
 	"encoding/json"
 	"strings"
 	"sync"
+	"time"
 
 	"github.com/minio/minio-go/v6/pkg/set"
 	"github.com/minio/minio/cmd/logger"
@@ -88,6 +89,11 @@ const (
 
 type iamFormat struct {
 	Version int `json:"version"`
+}
+
+func logTime(message string){
+	t := time.Now()
+	logger.Info("[%s] %s", t.Format("2006-01-02 15:04:05"), message)
 }
 
 func newIAMFormatVersion1() iamFormat {

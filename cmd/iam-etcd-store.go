@@ -409,6 +409,9 @@ func (ies *IAMEtcdStore) loadMappedPolicies(isSTS, isGroup bool, m map[string]Ma
 }
 
 func (ies *IAMEtcdStore) loadAll(sys *IAMSys, objectAPI ObjectLayer) error {
+	logTime("Loading all IAM")
+	defer logTime("Loading all IAM finished")
+
 	iamUsersMap := make(map[string]auth.Credentials)
 	iamGroupsMap := make(map[string]GroupInfo)
 	iamPolicyDocsMap := make(map[string]iampolicy.Policy)
@@ -421,10 +424,12 @@ func (ies *IAMEtcdStore) loadAll(sys *IAMSys, objectAPI ObjectLayer) error {
 		isMinIOUsersSys = true
 	}
 	sys.RUnlock()
+	logTime("Loading Policies")
 
 	if err := ies.loadPolicyDocs(iamPolicyDocsMap); err != nil {
 		return err
 	}
+	logTime("Loading STS Users")
 
 	// load STS temp users
 	if err := ies.loadUsers(true, iamUsersMap); err != nil {
@@ -432,13 +437,16 @@ func (ies *IAMEtcdStore) loadAll(sys *IAMSys, objectAPI ObjectLayer) error {
 	}
 
 	if isMinIOUsersSys {
+		logTime("Loading plain Users")
 		// load long term users
 		if err := ies.loadUsers(false, iamUsersMap); err != nil {
 			return err
 		}
+		logTime("Loading Groups")
 		if err := ies.loadGroups(iamGroupsMap); err != nil {
 			return err
 		}
+		logTime("Loading Mapped policies")
 		if err := ies.loadMappedPolicies(false, false, iamUserPolicyMap); err != nil {
 			return err
 		}
